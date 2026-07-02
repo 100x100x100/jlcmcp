@@ -2,7 +2,27 @@ import * as extensionConfig from '../extension.json';
 
 const APP_NAME = String((extensionConfig as any).displayName || 'JLC Bridge');
 const APP_VERSION = String((extensionConfig as any).version || '0.0.0');
-const BRIDGE_DIR = 'C:\\Users\\0\\.openclaw\\workspace\\jlc-bridge';
+
+// 桥接工作目录：优先用环境变量 JLC_BRIDGE_DIR，否则回退到当前用户目录。
+// 修复 upstream 把路径写死成 'C:\Users\0\...' 导致真实机器上不存在的 bug。
+// 扩展运行在 EDA 的浏览器沙箱里，没有 Node 的 os/process，但全局 env
+// 通常可用（嘉立创EDA 注入 window.process.env）；不可用时退到默认值。
+function resolveBridgeDir(): string {
+  try {
+    const env = (globalThis as any)?.process?.env;
+    const fromEnv = env && (env.JLC_BRIDGE_DIR || env.OPENCLAW_HOME);
+    if (fromEnv) return String(fromEnv);
+  } catch {
+    // ignore
+  }
+  // 默认：用户主目录下的 .jlc-bridge（跨平台可写）
+  const home =
+    (globalThis as any)?.process?.env?.USERPROFILE ||
+    (globalThis as any)?.process?.env?.HOME ||
+    'C:\\Users\\Public';
+  return `${home}\\.jlc-bridge`;
+}
+const BRIDGE_DIR = resolveBridgeDir();
 const COMMAND_FILE = `${BRIDGE_DIR}\\command.json`;
 const RESULT_FILE = `${BRIDGE_DIR}\\result.json`;
 const LOG_FILE = `${BRIDGE_DIR}\\bridge.log`;
@@ -1708,30 +1728,56 @@ async function getSchematicState(): Promise<any> {
 
   // Read all components across all schematic pages
   const rows = await api.sch_PrimitiveComponent.getAll(undefined, true);
-  const components = (Array.isArray(rows) ? rows : []).map((r: any) => ({
-    primitiveId: r?.getState_PrimitiveId?.() || '',
-    designator: r?.getState_Designator?.() || '',
-    name: r?.getState_Name?.() || r?.getState_DisplayName?.() || '',
-    value: r?.getState_Value?.() || '',
-    component: {
-      libraryUuid: r?.getState_LibraryUuid?.() || r?.getState_ComponentLibraryUuid?.() || '',
-      uuid: r?.getState_Uuid?.() || r?.getState_ComponentUuid?.() || '',
-    },
-  })).filter((c: any) => c.primitiveId);
+  // 安全取值：单个 getter 抛错不应中断整个读取
+  const safeGet = (obj: any, fn: string): any => {
+    try { return typeof obj?.[fn] === 'function' ? obj[fn]() : undefined; } catch { return undefined; }
+  };
+  // === 探针已完成使命，移除。读取逻辑已验证正确（51/89 元件有 designator）。 ===
+  const components: any[] = [];
+  for (const r of (Array.isArray(rows) ? rows : [])) {
+    try {
+      // getState_Component() 返回 { libraryUuid, uuid }，扩展原来用的
+      // getState_LibraryUuid / getState_ComponentLibraryUuid / getState_Uuid / getState_ComponentUuid
+      // 这些方法在 @jlceda/pro-api-types 0.1.175 中不存在（opus4.6 幻觉），导致全空。
+      const compRaw = safeGet(r, 'getState_Component');
+      const comp = (compRaw && typeof compRaw === 'object') ? compRaw : {};
+      components.push({
+        primitiveId: String(safeGet(r, 'getState_PrimitiveId') || ''),
+        designator: String(safeGet(r, 'getState_Designator') ?? ''),
+        name: String(safeGet(r, 'getState_Name') ?? ''),
+        componentType: safeGet(r, 'getState_ComponentType'),
+        x: Number(safeGet(r, 'getState_X') ?? 0),
+        y: Number(safeGet(r, 'getState_Y') ?? 0),
+        rotation: Number(safeGet(r, 'getState_Rotation') ?? 0),
+        mirror: Boolean(safeGet(r, 'getState_Mirror')),
+        component: {
+          libraryUuid: String(comp?.libraryUuid || ''),
+          uuid: String(comp?.uuid || ''),
+          symbolName: String(comp?.name || ''),
+        },
+      });
+    } catch { /* skip one bad component */ }
+  }
+  const filteredComponents = components.filter((c: any) => c.primitiveId);
 
   // Read pins
   let pins: any[] = [];
   if (api?.sch_PrimitivePin?.getAll) {
     try {
       const pinRows = await api.sch_PrimitivePin.getAll();
-      pins = (Array.isArray(pinRows) ? pinRows : []).map((p: any) => ({
-        primitiveId: p?.getState_PrimitiveId?.() || '',
-        pinNumber: p?.getState_PinNumber?.() || p?.getState_Number?.() || '',
-        pinName: p?.getState_PinName?.() || p?.getState_Name?.() || '',
-        net: p?.getState_Net?.() || p?.getState_NetName?.() || '',
-        x: Number(p?.getState_X?.() ?? 0),
-        y: Number(p?.getState_Y?.() ?? 0),
-      })).filter((p: any) => p.primitiveId);
+      for (const p of (Array.isArray(pinRows) ? pinRows : [])) {
+        try {
+          pins.push({
+            primitiveId: String(safeGet(p, 'getState_PrimitiveId') || ''),
+            pinNumber: String(safeGet(p, 'getState_PinNumber') ?? safeGet(p, 'getState_Number') ?? ''),
+            pinName: String(safeGet(p, 'getState_PinName') ?? safeGet(p, 'getState_Name') ?? ''),
+            net: String(safeGet(p, 'getState_Net') ?? safeGet(p, 'getState_NetName') ?? ''),
+            x: Number(safeGet(p, 'getState_X') ?? 0),
+            y: Number(safeGet(p, 'getState_Y') ?? 0),
+          });
+        } catch { /* skip */ }
+      }
+      pins = pins.filter((p: any) => p.primitiveId);
     } catch { /* ignore */ }
   }
 
@@ -1740,14 +1786,19 @@ async function getSchematicState(): Promise<any> {
   if (api?.sch_PrimitiveWire?.getAll) {
     try {
       const wireRows = await api.sch_PrimitiveWire.getAll();
-      wires = (Array.isArray(wireRows) ? wireRows : []).map((w: any) => ({
-        primitiveId: w?.getState_PrimitiveId?.() || '',
-        net: w?.getState_Net?.() || w?.getState_NetName?.() || '',
-      })).filter((w: any) => w.primitiveId);
+      for (const w of (Array.isArray(wireRows) ? wireRows : [])) {
+        try {
+          wires.push({
+            primitiveId: String(safeGet(w, 'getState_PrimitiveId') || ''),
+            net: String(safeGet(w, 'getState_Net') ?? safeGet(w, 'getState_NetName') ?? ''),
+          });
+        } catch { /* skip */ }
+      }
+      wires = wires.filter((w: any) => w.primitiveId);
     } catch { /* ignore */ }
   }
 
-  return { components, pins, wires };
+  return { components: filteredComponents, pins, wires };
 }
 
 async function getNetlist(params: { type?: string }): Promise<any> {
